@@ -59,7 +59,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", 150))
+@app.get("/", response_class=HTMLResponse)
+async def serve_frontend():
+    """Serve the main HTML interface"""
+    try:
+        with open("index.html", "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    except FileNotFoundError:
+        return HTMLResponse(content="<h1>Frontend not found</h1><p>Please ensure index.html is in the same directory as app.py</p>", status_code=404)
+
+
+LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", 180))
 
 # -----------------------------
 # Tools
@@ -85,7 +95,7 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
             "Referer": "https://www.google.com/",
         }
 
-        resp = requests.get(url, headers=headers, timeout=20)
+        resp = requests.get(url, headers=headers, timeout=50)
         resp.raise_for_status()
         ctype = resp.headers.get("Content-Type", "").lower()
 
@@ -277,7 +287,7 @@ def plot_to_base64(max_bytes=100000):
     img_bytes = buf.getvalue()
     # if already under limit, return png data uri
     if len(img_bytes) <= max_bytes:
-        return "data:image/png;base64," + base64.b64encode(img_bytes).decode('ascii')
+        return base64.b64encode(img_bytes).decode('ascii')
     # try decreasing dpi/figure size iteratively
     for dpi in [80, 60, 50, 40, 30]:
         buf = BytesIO()
@@ -285,7 +295,7 @@ def plot_to_base64(max_bytes=100000):
         buf.seek(0)
         b = buf.getvalue()
         if len(b) <= max_bytes:
-            return "data:image/png;base64," + base64.b64encode(b).decode('ascii')
+            return base64.b64encode(b).decode('ascii')
     # if Pillow available, try convert to WEBP which is typically smaller
     try:
         from PIL import Image
@@ -298,21 +308,21 @@ def plot_to_base64(max_bytes=100000):
         out_buf.seek(0)
         ob = out_buf.getvalue()
         if len(ob) <= max_bytes:
-            return "data:image/webp;base64," + base64.b64encode(ob).decode('ascii')
+            return base64.b64encode(ob).decode('ascii')
         # try lower quality
         out_buf = BytesIO()
         im.save(out_buf, format='WEBP', quality=60, method=6)
         out_buf.seek(0)
         ob = out_buf.getvalue()
         if len(ob) <= max_bytes:
-            return "data:image/webp;base64," + base64.b64encode(ob).decode('ascii')
+            return base64.b64encode(ob).decode('ascii')
     except Exception:
         pass
     # as last resort return a downsized PNG even if > max_bytes
     buf = BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight', dpi=20)
     buf.seek(0)
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode('ascii')
+    return  base64.b64encode(buf.getvalue()).decode('ascii')
 '''
 
     # Build the code to write
@@ -380,8 +390,9 @@ You must:
 1. Follow the provided rules exactly.
 2. Return only a valid JSON object — no extra commentary or formatting.
 3. The JSON must contain:
-   - "questions": [ keys from the questions file"]
-   - "code": "..." (Python code that creates a dict called `results` with each question string as a key and its computed answer as the value)
+   - "questions":  keys provided in the questions file
+   - "code": "..." (Python code that fills `results` with exact type of answer of each question as given in questions file and question keys as keys)\n'
+   - "Note" : the type of each answer should match the type it is asked in question file(e.g. int, float, str, boolean ,base64).
 4. Your Python code will run in a sandbox with:
    - pandas, numpy, matplotlib available
    - A helper function `plot_to_base64(max_bytes=100000)` for generating base64-encoded images under 100KB.
@@ -452,6 +463,36 @@ async def analyze_data(request: Request):
         questions_file = txt_files[0]
         raw_questions = (await questions_file.read()).decode("utf-8")
 
+
+        type_map = {}
+        patterns = [
+            re.compile(r"^\s*-\s*`([^`]+)`\s*:\s*([a-zA-Z ]+)", re.MULTILINE),  # bullet list with backticks
+            re.compile(r"^\s*-\s*([a-zA-Z0-9_]+)\s*:\s*([a-zA-Z ]+)", re.MULTILINE),  # bullet list no backticks
+            re.compile(r"`([^`]+)`\s*\((number|string|boolean|base64)[s]?\)", re.IGNORECASE),  # inline (type)
+        ]
+
+        for pat in patterns:
+            for match in pat.finditer(raw_questions):
+                key, type_hint = match.groups()
+                norm_type = type_hint.strip().lower()
+                if norm_type in ("number", "float", "int"):
+                    norm_type = "number"
+                elif norm_type in ("string", "str"):
+                    norm_type = "string"
+                elif "base64" in norm_type:
+                    norm_type = "base64"
+                elif norm_type in ("bool", "boolean"):
+                    norm_type = "boolean"
+                type_map[key.strip()] = norm_type
+
+        # Build type note for LLM prompt
+        type_note = "\nNote: The following are the exact expected types for each key based on the questions file:\n"
+        if type_map:
+            for k, t in type_map.items():
+                type_note += f"- {k}: {t}\n"
+        else:
+            type_note += "(No explicit types detected in questions file)\n"
+
         # All others are candidate datasets
         data_candidates = [f for f in uploads if f is not questions_file]
 
@@ -476,11 +517,16 @@ async def analyze_data(request: Request):
                         df = pd.read_json(BytesIO(content))
                     except ValueError:
                         df = pd.DataFrame(json.loads(content.decode("utf-8")))
-                elif filename.endswith(".txt"):
+                elif filename.endswith(".png") or filename.endswith(".jpg") or filename.endswith(".jpeg"):
                     try:
-                        df = pd.read_csv(BytesIO(content), sep=None, engine="python")
-                    except Exception:
-                        df = pd.DataFrame({"text": content.decode("utf-8").splitlines()})
+                        if PIL_AVAILABLE:
+                            image = Image.open(BytesIO(content))
+                            image = image.convert("RGB")  # ensure RGB format
+                            df = pd.DataFrame({"image": [image]})  # store as a single column DataFrame
+                        else:
+                            raise ValueError("PIL is not available for image processing.")
+                    except Exception as e:
+                        raise ValueError(f"Failed to process image file: {str(e)}")
                 else:
                     continue  # unsupported type
             except Exception:
@@ -508,8 +554,8 @@ async def analyze_data(request: Request):
                 "2) DO NOT call scrape_url_to_dataframe() or fetch any external data.\n"
                 "3) Use only the uploaded dataset for answering questions.\n"
                 "4) Produce a final JSON object with keys:\n"
-                '   - "questions": keys provided in questions txt file\n'
-                '   - "code": "..."  (Python code that fills `results` with exact question strings as keys)\n'
+                '   - "questions": exact keys provided in questions txt file \n'
+                '   - "code": "..."  (Python code that fills `results` with exact type of answer of each question as given in questions file and question keys as keys)\n'
                 "5) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
             )
         else:
@@ -517,21 +563,22 @@ async def analyze_data(request: Request):
                 "Rules:\n"
                 "1) If you need web data, CALL scrape_url_to_dataframe(url).\n"
                 "2) Produce a final JSON object with keys:\n"
-                '   - "questions": [ ... original question strings ... ]\n'
-                '   - "code": "..."  (Python code that fills `results` with exact question strings as keys)\n'
+                '   - "questions": exact keys provided in questions txt file \n'
+                '   - "code": "..."  (Python code that fills `results` with exact type of answer of each question as given in questions file and question keys as keys)\n'
                 "3) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
             )
 
         llm_input = (
             f"{llm_rules}\nQuestions:\n{raw_questions}\n"
-            f"{df_preview if df_preview else ''}"
+            f"{df_preview if df_preview else ''}\n"
+            f"{type_note}\n"
             "Respond with the JSON object only."
         )
 
         # Run unified agent
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as ex:
-            fut = ex.submit(run_agent_safely_unified, llm_input, pickle_path)
+            fut = ex.submit(run_agent_safely_unified, llm_input, pickle_path, type_map)
             try:
                 result = fut.result(timeout=LLM_TIMEOUT_SECONDS)
             except concurrent.futures.TimeoutError:
@@ -553,7 +600,7 @@ async def analyze_data(request: Request):
 # Runner: orchestrates agent -> pre-scrape inject -> execute
 # -----------------------------
     
-def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
+def run_agent_safely_unified(llm_input: str, pickle_path: str = None, type_map: dict = None) -> Dict:
     """
     Runs the LLM agent and executes code.
     - If pickle_path is provided, injects that DataFrame directly.
@@ -595,7 +642,22 @@ def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
             return {"error": f"Execution failed: {exec_result.get('message')}", "raw": exec_result.get("raw")}
 
         results_dict = exec_result.get("result", {})
-        print(f"Results dict: {results_dict}")  
+        print(f"Results dict: {results_dict}")
+        if type_map:
+            for k, expected in type_map.items():
+                if k not in results_dict:
+                    continue
+                v = results_dict[k]
+                if expected == "number":
+                    try:
+                        num = float(v)
+                        results_dict[k] = int(num) if num.is_integer() else num
+                    except:
+                        results_dict[k] = None
+                elif expected in ("string", "base64"):
+                    results_dict[k] = "" if v is None else str(v)
+                elif expected == "boolean":
+                    results_dict[k] = bool(v)  
         return results_dict
 
     except Exception as e:
@@ -633,4 +695,3 @@ async def analyze_get_info():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
-
